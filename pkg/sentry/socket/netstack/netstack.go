@@ -874,7 +874,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		size, err := ep.GetSockOptInt(tcpip.ReceiveBufferSizeOption)
+		size, err := ep.SocketOptions().GetReceiveBufferSize()
 		if err != nil {
 			return nil, syserr.TranslateNetstackError(err)
 		}
@@ -1659,7 +1659,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.ReceiveBufferSizeOption, int(v)))
+		ep.SocketOptions().SetReceiveBufferSize(int64(v), true)
+		return nil
 
 	case linux.SO_REUSEADDR:
 		if len(optVal) < sizeOfInt32 {

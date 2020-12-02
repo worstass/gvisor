@@ -861,12 +861,29 @@ func (e *baseEndpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
 }
 
 func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error {
-	switch opt {
-	case tcpip.ReceiveBufferSizeOption:
-	default:
-		log.Warningf("Unsupported socket option: %d", opt)
-	}
+	log.Warningf("Unsupported socket option: %d", opt)
 	return nil
+}
+
+// IsUnixSocket implements tcpip.SocketOptionsHandler.IsUnixSocket.
+func (e *baseEndpoint) IsUnixSocket() bool {
+	return true
+}
+
+// GetReceiveBufferSize implements tcpip.SocketOptionsHandler.GetReceiveBufferSize.
+func (e *baseEndpoint) GetReceiveBufferSize() (int64, tcpip.Error) {
+	e.Lock()
+	defer e.Unlock()
+
+	if e.receiver == nil {
+		return -1, &tcpip.ErrNotConnected{}
+	}
+
+	v := e.receiver.RecvMaxQueueSize()
+	if v < 0 {
+		return -1, &tcpip.ErrQueueSizeNotSupported{}
+	}
+	return v, nil
 }
 
 func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error) {
@@ -892,19 +909,6 @@ func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error) {
 			return -1, &tcpip.ErrNotConnected{}
 		}
 		v := e.connected.SendQueuedSize()
-		e.Unlock()
-		if v < 0 {
-			return -1, &tcpip.ErrQueueSizeNotSupported{}
-		}
-		return int(v), nil
-
-	case tcpip.ReceiveBufferSizeOption:
-		e.Lock()
-		if e.receiver == nil {
-			e.Unlock()
-			return -1, &tcpip.ErrNotConnected{}
-		}
-		v := e.receiver.RecvMaxQueueSize()
 		e.Unlock()
 		if v < 0 {
 			return -1, &tcpip.ErrQueueSizeNotSupported{}

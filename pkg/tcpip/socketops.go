@@ -58,6 +58,19 @@ type SocketOptionsHandler interface {
 	// changed. The handler is invoked with the new value for the socket send
 	// buffer size. It also returns the newly set value.
 	OnSetSendBufferSize(v int64) (newSz int64)
+
+	// IsUnixSocket is invoked to check if the socket is of unix domain.
+	IsUnixSocket() bool
+
+	// OnReceiveBufferSizeOptionSet is invoked to set the SO_RCVBUFSIZE.
+	OnReceiveBufferSizeOptionSet(size int64) int64
+
+	// NotifyOnReceiveBufferSizeOptionSet is invoked to notify waiters that
+	// the receive buffer size has grown.
+	NotifyOnReceiveBufferSizeOptionSet(oldSize, newSize int64)
+
+	// GetReceiveBufferSize is invoked to get the SO_RCVBUFSIZE.
+	GetReceiveBufferSize() (int64, Error)
 }
 
 // DefaultSocketOptionsHandler is an embeddable type that implements no-op
@@ -97,6 +110,27 @@ func (*DefaultSocketOptionsHandler) HasNIC(int32) bool {
 // OnSetSendBufferSize implements SocketOptionsHandler.OnSetSendBufferSize.
 func (*DefaultSocketOptionsHandler) OnSetSendBufferSize(v int64) (newSz int64) {
 	return v
+}
+
+// IsUnixSocket implements SocketOptionsHandler.IsUnixSocket.
+func (*DefaultSocketOptionsHandler) IsUnixSocket() bool {
+	return false
+}
+
+// OnReceiveBufferSizeOptionSet implements
+// SocketOptionsHandler.OnReceiveBufferSizeOptionSet.
+func (*DefaultSocketOptionsHandler) OnReceiveBufferSizeOptionSet(receiveBufferSize int64) int64 {
+	return receiveBufferSize
+}
+
+// NotifyOnReceiveBufferSizeOptionSet implements
+// SocketOptionsHandler.NotifyOnReceiveBufferSizeOptionSet.
+func (*DefaultSocketOptionsHandler) NotifyOnReceiveBufferSizeOptionSet(oldSize, receiveBufferSize int64) {
+}
+
+// GetReceiveBufferSize implements SocketOptionsHandler.GetReceiveBufferSize.
+func (*DefaultSocketOptionsHandler) GetReceiveBufferSize() (int64, Error) {
+	return 0, nil
 }
 
 // StackHandler holds methods to access the stack options. These must be
@@ -207,6 +241,14 @@ type SocketOptions struct {
 	// sendBufferSize determines the send buffer size for this socket.
 	sendBufferSize int64
 
+	// getReceiveBufferLimits provides the handler to get the min, default and
+	// max size for receive buffer. It  is initialized at the creation time and
+	// will not change.
+	getReceiveBufferLimits GetReceiveBufferLimits `state:"manual"`
+
+	// receiveBufferSize determines the receive buffer size for this socket.
+	receiveBufferSize int64
+
 	// mu protects the access to the below fields.
 	mu sync.Mutex `state:"nosave"`
 
@@ -217,10 +259,11 @@ type SocketOptions struct {
 
 // InitHandler initializes the handler. This must be called before using the
 // socket options utility.
-func (so *SocketOptions) InitHandler(handler SocketOptionsHandler, stack StackHandler, getSendBufferLimits GetSendBufferLimits) {
+func (so *SocketOptions) InitHandler(handler SocketOptionsHandler, stack StackHandler, getSendBufferLimits GetSendBufferLimits, getReceiveBufferLimits GetReceiveBufferLimits) {
 	so.handler = handler
 	so.stackHandler = stack
 	so.getSendBufferLimits = getSendBufferLimits
+	so.getReceiveBufferLimits = getReceiveBufferLimits
 }
 
 func storeAtomicBool(addr *uint32, v bool) {
@@ -631,4 +674,51 @@ func (so *SocketOptions) SetSendBufferSize(sendBufferSize int64, notify bool) {
 	// Notify endpoint about change in buffer size.
 	newSz := so.handler.OnSetSendBufferSize(v)
 	atomic.StoreInt64(&so.sendBufferSize, newSz)
+}
+
+// GetReceiveBufferSize gets value for SO_RCVBUF option.
+func (so *SocketOptions) GetReceiveBufferSize() (int64, Error) {
+	if so.handler.IsUnixSocket() {
+		return so.handler.GetReceiveBufferSize()
+	}
+	return atomic.LoadInt64(&so.receiveBufferSize), nil
+}
+
+// SetReceiveBufferSize sets value for SO_RCVBUF option.
+func (so *SocketOptions) SetReceiveBufferSize(receiveBufferSize int64, notify bool) {
+	// We currently do not support setting this option for unix sockets.
+	if so.handler.IsUnixSocket() {
+		return
+	}
+
+	if !notify {
+		atomic.StoreInt64(&so.receiveBufferSize, receiveBufferSize)
+		return
+	}
+
+	// Make sure the send buffer size is within the min and max
+	// allowed.
+	v := receiveBufferSize
+	ss := so.getReceiveBufferLimits(so.stackHandler)
+	min := int64(ss.Min)
+	max := int64(ss.Max)
+	// Validate the send buffer size with min and max values.
+	if v > max {
+		v = max
+	}
+
+	// Multiply it by factor of 2.
+	if v < math.MaxInt32/PacketOverheadFactor {
+		v *= PacketOverheadFactor
+		if v < min {
+			v = min
+		}
+	} else {
+		v = math.MaxInt32
+	}
+
+	v = so.handler.OnReceiveBufferSizeOptionSet(v)
+	oldSize := atomic.LoadInt64(&so.receiveBufferSize)
+	atomic.StoreInt64(&so.receiveBufferSize, v)
+	so.handler.NotifyOnReceiveBufferSizeOptionSet(v, oldSize)
 }

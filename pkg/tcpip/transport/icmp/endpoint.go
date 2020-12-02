@@ -61,12 +61,11 @@ type endpoint struct {
 
 	// The following fields are used to manage the receive queue, and are
 	// protected by rcvMu.
-	rcvMu         sync.Mutex `state:"nosave"`
-	rcvReady      bool
-	rcvList       icmpPacketList
-	rcvBufSizeMax int `state:".(int)"`
-	rcvBufSize    int
-	rcvClosed     bool
+	rcvMu      sync.Mutex `state:"nosave"`
+	rcvReady   bool
+	rcvList    icmpPacketList
+	rcvBufSize int
+	rcvClosed  bool
 
 	// The following fields are protected by the mu mutex.
 	mu sync.RWMutex `state:"nosave"`
@@ -91,12 +90,11 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 			NetProto:   netProto,
 			TransProto: transProto,
 		},
-		waiterQueue:   waiterQueue,
-		rcvBufSizeMax: 32 * 1024,
-		state:         stateInitial,
-		uniqueID:      s.UniqueID(),
+		waiterQueue: waiterQueue,
+		state:       stateInitial,
+		uniqueID:    s.UniqueID(),
 	}
-	ep.ops.InitHandler(ep, ep.stack, tcpip.GetStackSendBufferLimits)
+	ep.ops.InitHandler(ep, ep.stack, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
 	ep.ops.SetSendBufferSize(32*1024, false /* notify */)
 
 	// Override with stack defaults.
@@ -104,6 +102,7 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 	if err := s.Option(&ss); err == nil {
 		ep.ops.SetSendBufferSize(int64(ss.Default), false /* notify */)
 	}
+	ep.ops.SetReceiveBufferSize(32*1024, false /* notify */)
 	return ep, nil
 }
 
@@ -366,12 +365,6 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error) {
 			p := e.rcvList.Front()
 			v = p.data.Size()
 		}
-		e.rcvMu.Unlock()
-		return v, nil
-
-	case tcpip.ReceiveBufferSizeOption:
-		e.rcvMu.Lock()
-		v := e.rcvBufSizeMax
 		e.rcvMu.Unlock()
 		return v, nil
 
@@ -744,7 +737,8 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 		return
 	}
 
-	if e.rcvBufSize >= e.rcvBufSizeMax {
+	rcvBufSize, _ := e.ops.GetReceiveBufferSize()
+	if e.rcvBufSize >= int(rcvBufSize) {
 		e.rcvMu.Unlock()
 		e.stack.Stats().DroppedPackets.Increment()
 		e.stats.ReceiveErrors.ReceiveBufferOverflow.Increment()
