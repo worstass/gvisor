@@ -349,6 +349,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		if err == syserror.ENOENT || err == syserror.ENODATA {
 			return nil, nil, alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s: %v", childrenOffsetXattr, err))
 		}
+
 		if err != nil {
 			return nil, nil, err
 		}
