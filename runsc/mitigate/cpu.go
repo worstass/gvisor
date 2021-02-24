@@ -68,6 +68,25 @@ func newCPUSet(data []byte, vulnerable func(*thread) bool) (cpuSet, error) {
 	return set, nil
 }
 
+// newCPUSetFromPossible makes a cpuSet data read from
+// /sys/devices/system/cpu/possible. This is used in enable operations
+// where the caller simply wants to enable all CPUS.
+func newCPUSetFromPossible(data []byte) (cpuSet, error) {
+	threads, err := getThreadsFromPossible(data)
+	if err != nil {
+		return nil, err
+	}
+
+	// We don't care if a CPU is vulnerable or not, we just
+	// want to return a list of all CPUs on the host.
+	set := make(cpuSet, 1)
+	set[threads[0].id] = &threadGroup{
+		threads:      threads,
+		isVulnerable: false,
+	}
+	return set, nil
+}
+
 // String implements the String method for CPUSet.
 func (c cpuSet) String() string {
 	ret := ""
@@ -129,7 +148,7 @@ func getThreads(data string) ([]*thread, error) {
 	r := buildRegex(processorKey, `\d+`)
 	indices := r.FindAllStringIndex(data, -1)
 	if len(indices) < 1 {
-		return nil, fmt.Errorf("no cpus found for: %s", data)
+		return nil, fmt.Errorf("no cpus found for: %q", data)
 	}
 
 	// Add the ending index for last entry.
@@ -152,6 +171,45 @@ func getThreads(data string) ([]*thread, error) {
 		cpus = append(cpus, c)
 	}
 	return cpus, nil
+}
+
+// getThreadsFromPossible makes threads from data read from /sys/devices/system/cpu/possible.
+func getThreadsFromPossible(data []byte) ([]*thread, error) {
+	possibleRegex := regexp.MustCompile(`(?m)^(\d+)(-(\d+))?$`)
+	matches := possibleRegex.FindStringSubmatch(string(data))
+	if len(matches) != 4 {
+		return nil, fmt.Errorf("mismatch regex from %s: %q", allPossibleCPUs, string(data))
+	}
+
+	// If matches[3] is empty, we only have one cpu entry.
+	if matches[3] == "" {
+		matches[3] = matches[1]
+	}
+
+	begin, err := strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse begin: %v", err)
+	}
+	end, err := strconv.ParseInt(matches[3], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse end: %v", err)
+	}
+	if begin > end || begin < 0 || end < 0 {
+		return nil, fmt.Errorf("invalid cpu bounds from possible: begin: %d end: %d", begin, end)
+	}
+
+	ret := make([]*thread, 0, end-begin)
+	for i := begin; i <= end; i++ {
+		ret = append(ret, &thread{
+			processorNumber: i,
+			id: cpuID{
+				physicalID: 0, // we don't care about id for enable ops.
+				coreID:     0,
+			},
+		})
+	}
+
+	return ret, nil
 }
 
 // cpuID for each thread is defined by the physical and
@@ -237,8 +295,14 @@ Bugs: %s
 	return fmt.Sprintf(template, t.processorNumber, t.id, t.vendorID, t.cpuFamily, t.model, strings.Join(bugs, ","))
 }
 
-// shutdown turns off the CPU by writing 0 to /sys/devices/cpu/cpu{N}/online.
-func (t *thread) shutdown() error {
+// enable turns on the CPU by writing 1 to /sys/devices/cpu/cpu{N}/online.
+func (t *thread) enable() error {
+	cpuPath := fmt.Sprintf(cpuOnlineTemplate, t.processorNumber)
+	return ioutil.WriteFile(cpuPath, []byte{'1'}, 0644)
+}
+
+// disable turns off the CPU by writing 0 to /sys/devices/cpu/cpu{N}/online.
+func (t *thread) disable() error {
 	cpuPath := fmt.Sprintf(cpuOnlineTemplate, t.processorNumber)
 	return ioutil.WriteFile(cpuPath, []byte{'0'}, 0644)
 }
@@ -351,7 +415,7 @@ func parseRegex(data, key, match string) (string, error) {
 	r := buildRegex(key, match)
 	matches := r.FindStringSubmatch(data)
 	if len(matches) < 2 {
-		return "", fmt.Errorf("failed to match key %s: %s", key, data)
+		return "", fmt.Errorf("failed to match key %q: %q", key, data)
 	}
 	return matches[1], nil
 }
