@@ -44,6 +44,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
 	refs_vfs1 "gvisor.dev/gvisor/pkg/refs"
@@ -87,6 +88,10 @@ type filesystem struct {
 
 	// client is the client used by this filesystem. client is immutable.
 	client *p9.Client `state:"nosave"`
+
+	// lisafsCient is the client used for communicating with the server when
+	// lisafs is enabled. lisafsCient is immutable.
+	lisafsCient *lisafs.Client `state:"nosave"`
 
 	// clock is a realtime clock used to set timestamps in file operations.
 	clock ktime.Clock
@@ -183,6 +188,10 @@ type filesystemOptions struct {
 	// way that application FDs representing "special files" such as sockets
 	// do. Note that this disables client caching and mmap for regular files.
 	regularFilesUseSpecialFileFD bool
+
+	// If useLisafs is true, then the client will use lisafs protocol to
+	// communicate with the server instead of 9P.
+	useLisafs bool
 }
 
 // InteropMode controls the client's interaction with other remote filesystem
@@ -396,6 +405,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		delete(mopts, "overlayfs_stale_read")
 		fsopts.overlayfsStaleRead = true
 	}
+	if lisafs, ok := mopts["lisafs"]; ok {
+		delete(mopts, "lisafs")
+		fsopts.useLisafs = lisafs == "true"
+	}
 	// fsopts.regularFilesUseSpecialFileFD can only be enabled by specifying
 	// "cache=none".
 
@@ -430,34 +443,16 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
-	// Connect to the server.
-	if err := fs.dial(ctx); err != nil {
+	var root *dentry
+	if fsopts.useLisafs {
+		root, err = fs.initClientLisafs(ctx)
+	} else {
+		root, err = fs.initClient(ctx)
+	}
+	if err != nil {
 		return nil, nil, err
 	}
 
-	// Perform attach to obtain the filesystem root.
-	ctx.UninterruptibleSleepStart(false)
-	attached, err := fs.client.Attach(fsopts.aname)
-	ctx.UninterruptibleSleepFinish(false)
-	if err != nil {
-		fs.vfsfs.DecRef(ctx)
-		return nil, nil, err
-	}
-	attachFile := p9file{attached}
-	qid, attrMask, attr, err := attachFile.getAttr(ctx, dentryAttrMask())
-	if err != nil {
-		attachFile.close(ctx)
-		fs.vfsfs.DecRef(ctx)
-		return nil, nil, err
-	}
-
-	// Construct the root dentry.
-	root, err := fs.newDentry(ctx, attachFile, qid, attrMask, &attr)
-	if err != nil {
-		attachFile.close(ctx)
-		fs.vfsfs.DecRef(ctx)
-		return nil, nil, err
-	}
 	// Set the root's reference count to 2. One reference is returned to the
 	// caller, and the other is held by fs to prevent the root from being "cached"
 	// and subsequently evicted.
@@ -465,6 +460,57 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fs.root = root
 
 	return &fs.vfsfs, &root.vfsd, nil
+}
+
+func (fs *filesystem) initClientLisafs(ctx context.Context) (*dentry, error) {
+	sock, err := unet.NewSocket(fs.opts.fd)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx.UninterruptibleSleepStart(false)
+	fs.lisafsCient, err = lisafs.NewClient(sock, fs.opts.aname)
+	ctx.UninterruptibleSleepFinish(false)
+	if err != nil {
+		fs.vfsfs.DecRef(ctx)
+		return nil, err
+	}
+
+	// TODO(ayushranjan): complete.
+	return nil, nil
+}
+
+func (fs *filesystem) initClient(ctx context.Context) (*dentry, error) {
+	// Connect to the server.
+	if err := fs.dial(ctx); err != nil {
+		fs.vfsfs.DecRef(ctx)
+		return nil, err
+	}
+
+	// Perform attach to obtain the filesystem root.
+	ctx.UninterruptibleSleepStart(false)
+	attached, err := fs.client.Attach(fs.opts.aname)
+	ctx.UninterruptibleSleepFinish(false)
+	if err != nil {
+		fs.vfsfs.DecRef(ctx)
+		return nil, err
+	}
+	attachFile := p9file{attached}
+	qid, attrMask, attr, err := attachFile.getAttr(ctx, dentryAttrMask())
+	if err != nil {
+		attachFile.close(ctx)
+		fs.vfsfs.DecRef(ctx)
+		return nil, err
+	}
+
+	// Construct the root dentry.
+	root, err := fs.newDentry(ctx, attachFile, qid, attrMask, &attr)
+	if err != nil {
+		attachFile.close(ctx)
+		fs.vfsfs.DecRef(ctx)
+		return nil, err
+	}
+	return root, nil
 }
 
 func getFDFromMountOptionsMap(ctx context.Context, mopts map[string]string) (int, error) {
